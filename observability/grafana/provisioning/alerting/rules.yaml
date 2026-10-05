@@ -1,0 +1,60 @@
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: order-tracker
+    folder: Order Tracker
+    interval: 10s
+    rules:
+      - uid: order-tracker-5xx
+        title: Order Tracker 5xx errors
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              editorMode: code
+              # New 5xx responses in the last 2 minutes, one series per endpoint.
+              # "counter - counter offset 2m" instead of increase(): increase()
+              # drops a counter's first sample, which would hide the very first
+              # error right after a (re)start. The "or ... * 0" fallback covers
+              # series younger than the window.
+              expr: sum by (http_route) (http_server_requests_total{http_response_status_code=~"5.."} - (http_server_requests_total{http_response_status_code=~"5.."} offset 2m or http_server_requests_total{http_response_status_code=~"5.."} * 0))
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              settings: { mode: dropNN }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        # No data (service idle / restarting) is NOT an incident -> stays Normal.
+        noDataState: OK
+        # A failing query is not silently Normal: surface it as an Error alert.
+        execErrState: Error
+        for: 0s
+        annotations:
+          summary: "5xx errors on {{ $$labels.http_route }} in the last 2 minutes"
+          description: >-
+            order-tracker returned HTTP 5xx on endpoint {{ $$labels.http_route }}
+            ({{ $$values.B.Value }} errors in the last 2 minutes, evaluated every 10s).
+            Check the dashboard and logs/traces for the failing request.
+          endpoint: "{{ $$labels.http_route }}"
+          window: "2m"
+          __dashboardUid__: order-tracker
+          __panelId__: "6"
+          runbook_url: http://localhost:3000/d/order-tracker/order-tracker-requests-and-errors
+        labels:
+          severity: critical
+          service: order-tracker
+        isPaused: false

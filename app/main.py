@@ -1,17 +1,27 @@
 import os
 import sqlite3
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
+from opentelemetry.propagate import extract
+from opentelemetry.trace import SpanKind, Status, StatusCode
 from pydantic import BaseModel, Field
+
+from app.telemetry import create_telemetry
 
 
 DB_PATH = Path(os.getenv("ORDER_DB_PATH", "data/orders.db"))
 STATUSES = {"received", "preparing", "shipped", "delivered"}
+
+# Traces, metrics and logs. Console exporters are always on (visible in
+# `docker compose logs app`); OTLP export to the Collector turns on when
+# OTEL_EXPORTER_OTLP_ENDPOINT is set. Tests swap this object out.
+telemetry = create_telemetry()
 
 
 def connect():
@@ -73,10 +83,84 @@ class StatusUpdate(BaseModel):
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    telemetry.seed_error_series(
+        [
+            (method, route.path)
+            for route in _app.routes
+            for method in sorted(getattr(route, "methods", None) or ())
+            if method not in {"HEAD", "OPTIONS"} and route.path.startswith(("/api", "/healthz"))
+        ]
+    )
     yield
+    telemetry.shutdown()
 
 
 app = FastAPI(title="Order Tracker", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def observe_requests(request: Request, call_next):
+    """One server span, one log line and the request metrics per HTTP request."""
+    started = time.perf_counter()
+    status_code = 500
+    failure = None
+    if request.url.path == "/healthz":
+        # Probes (Compose healthcheck every 5s) count in the metrics but stay
+        # out of spans and logs, which would otherwise drown real traffic.
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        finally:
+            telemetry.record_request(
+                request.method, "/healthz", status_code, time.perf_counter() - started
+            )
+    span_cm = telemetry.tracer.start_as_current_span(
+        f"{request.method} {request.url.path}",
+        context=extract(dict(request.headers)),
+        kind=SpanKind.SERVER,
+        attributes={"http.request.method": request.method, "url.path": request.url.path},
+        record_exception=False,
+        set_status_on_exception=False,
+    )
+    with span_cm as span:
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        except Exception as exc:  # unhandled -> uvicorn answers 500
+            failure = exc
+            span.record_exception(exc)
+            raise
+        finally:
+            route_obj = request.scope.get("route")
+            route = getattr(route_obj, "path", None) or "unmatched"
+            elapsed = time.perf_counter() - started
+            span.update_name(f"{request.method} {route}")
+            span.set_attribute("http.route", route)
+            span.set_attribute("http.response.status_code", status_code)
+            if status_code >= 500:
+                span.set_status(Status(StatusCode.ERROR))
+            telemetry.record_request(request.method, route, status_code, elapsed)
+            fields = {
+                "http.request.method": request.method,
+                "http.route": route,
+                "url.path": request.url.path,
+                "http.response.status_code": status_code,
+                "http.server.duration_ms": round(elapsed * 1000, 2),
+            }
+            if failure is not None:
+                telemetry.logger.error(
+                    "request failed: %s: %s",
+                    type(failure).__name__,
+                    failure,
+                    exc_info=(type(failure), failure, failure.__traceback__),
+                    extra=fields,
+                )
+            else:
+                telemetry.logger.info(
+                    "%s %s -> %s", request.method, request.url.path, status_code, extra=fields
+                )
 
 
 @app.get("/")
@@ -100,11 +184,16 @@ def list_orders():
 
 @app.get("/api/orders/{order_id}")
 def get_order(order_id: str):
-    with connect() as db:
-        row = db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-    if row is None:
-        raise HTTPException(404, "Order not found")
-    return order_detail(row)
+    with telemetry.tracer.start_as_current_span("order.lookup") as span:
+        span.set_attribute("order.id", order_id)
+        with connect() as db:
+            row = db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+        span.set_attribute("order.found", row is not None)
+        if row is None:
+            telemetry.logger.warning("order not found", extra={"order.id": order_id})
+            raise HTTPException(404, "Order not found")
+        span.set_attribute("order.priority", row["priority"])
+        return order_detail(row)
 
 
 @app.post("/api/orders", status_code=201)
